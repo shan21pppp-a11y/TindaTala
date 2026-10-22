@@ -1,5 +1,5 @@
 /* Supabase values for TindaTala (shared database). Empty = data stays on each phone only. */
 window.TT_CONFIG = {
-  url: 'https://lbuafmwpeaqiqdytxnnu.supabase.co',
-  key: 'sb_publishable_Yr5MAnyLtB7o812wMjZdRQ_u8oyWTLE'
+  url: 'https://nirurllhgnguxpwsuqys.supabase.co/rest/v1/',
+  key: 'sb_publishable_Ze38Lm4eVOg4fg25OmFzTQ_2ORGnzcn'
 };
