@@ -1,5 +1,5 @@
-/* Paste your Supabase values here (see README-CLOUD.txt).  Leave empty = data stays on each phone only. */
+/* Supabase values for TindaTala (shared database). Empty = data stays on each phone only. */
 window.TT_CONFIG = {
-  url: '',   // example: 'https://abcdxyz.supabase.co'
-  key: ''    // the "anon" / "publishable" key (safe to put here; it is public by design)
+  url: 'https://lbuafmwpeaqiqdytxnnu.supabase.co',
+  key: 'sb_publishable_Yr5MAnyLtB7o812wMjZdRQ_u8oyWTLE'
 };
