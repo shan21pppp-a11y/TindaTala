@@ -67,16 +67,128 @@ body{font-size:12.5px}.card{padding:9px;border-radius:12px;margin-bottom:8px}.he
 <div class="bar" id="bar"></div>
 <div class="sn"><span>|||</span><span>○</span><span>‹</span></div>
 <div id="sheet"></div><div class="toast" id="toast"></div></div>
+<script src="config.js"></script>
 <script>
-/* OFFLINE STORAGE: localStorage is the live copy; every write is also mirrored to the phone's native storage
-   (Capacitor Preferences) so iOS/Android cannot silently clear it. No server needed. */
-const _s=Storage.prototype.setItem,_r=Storage.prototype.removeItem,MIR=k=>k.startsWith('tt_')||k.startsWith('tindatala');
-const NP=(()=>{try{const C=window.Capacitor;if(C&&C.isNativePlatform&&C.isNativePlatform())return C.Plugins.Preferences||C.registerPlugin('Preferences')}catch(e){}return null})();
-Storage.prototype.setItem=function(k,v){_s.call(this,k,v);if(NP&&this===window.localStorage&&MIR(k))NP.set({key:k,value:String(v)}).catch(()=>{})};
-Storage.prototype.removeItem=function(k){_r.call(this,k);if(NP&&this===window.localStorage&&MIR(k))NP.remove({key:k}).catch(()=>{})};
-async function hydrate(){if(!NP)return;try{const{keys}=await NP.keys(),have=new Set(keys);
-for(const k of keys){const{value}=await NP.get({key:k});if(value!=null)_s.call(localStorage,k,value)}
-for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(MIR(k)&&!have.has(k))NP.set({key:k,value:localStorage.getItem(k)}).catch(()=>{})}}catch(e){}}
+/* ===== CLOUD SYNC (Supabase) =====
+   localStorage stays the working copy the app already uses. Every change to the shared keys
+   (tt_accounts + tindatala_<user>) is merged with the shared database, so all phones/computers see
+   the same admin, users, chat, payments and store data.  3-way merge = nobody overwrites anybody. */
+function TTSync(env){
+const ls=env.ls,proto=env.proto,cfg=env.cfg||{},F=env.fetch,SB=!!(cfg.url&&cfg.key),
+ BASE=SB?String(cfg.url).replace(/\/+$/,'')+'/rest/v1/kv_store':'',
+ SYNCK=k=>k==='tt_accounts'||(k.startsWith('tindatala_')&&k!=='tindatala_lang'),
+ _s=proto.setItem,_r=proto.removeItem,_g=proto.getItem,
+ get=k=>_g.call(ls,k),put=(k,v)=>{try{_s.call(ls,k,v)}catch(e){}},del=k=>{try{_r.call(ls,k)}catch(e){}};
+/* ---------- 3-way merge ---------- */
+const isA=Array.isArray,isO=x=>x!==null&&typeof x==='object'&&!isA(x),
+ cs=x=>JSON.stringify(x,(k,v)=>isO(v)?Object.keys(v).sort().reduce((o,i)=>(o[i]=v[i],o),{}):v),
+ eq=(a,b)=>cs(a)===cs(b);
+function keyer(items){
+ if(!items.length||!items.every(isO))return null;
+ if(items.every(x=>x.id!==undefined))return x=>'i'+x.id;
+ if(items.every(x=>x.username!==undefined))return x=>'u'+x.username;
+ if(items.every(x=>x.u!==undefined&&x.at!==undefined))return x=>'l'+x.u+'|'+x.at;
+ return null}
+function mArr(b,l,r){
+ const kf=keyer([...b,...l,...r]);
+ if(!kf)return l;                                      // cannot match items: keep this device's list
+ const ix=a=>new Map(a.map(x=>[kf(x),x])),B=ix(b),L=ix(l),R=ix(r),out=[],seen=new Set();
+ for(const k of [...L.keys(),...R.keys()]){if(seen.has(k))continue;seen.add(k);
+  const bv=B.get(k),lv=L.get(k),rv=R.get(k);
+  if(lv!==undefined&&rv!==undefined)out.push(mv(bv,lv,rv));
+  else if(lv!==undefined){if(bv===undefined||!eq(lv,bv))out.push(lv)}   // added here, or changed here while deleted there
+  else{if(bv===undefined||!eq(rv,bv))out.push(rv)}}                     // added there, or changed there while deleted here
+ if(out.length&&out.every(x=>isO(x)&&typeof x.a==='string'))out.sort((x,y)=>x.a<y.a?-1:x.a>y.a?1:String(x.id)<String(y.id)?-1:1);
+ else if(out.length&&out.every(x=>isO(x)&&typeof x.at==='string'&&x.u!==undefined))out.sort((x,y)=>x.at<y.at?-1:x.at>y.at?1:x.u<y.u?-1:1);
+ return out}
+function mObj(b,l,r){const o={};for(const k of new Set([...Object.keys(b),...Object.keys(l),...Object.keys(r)])){const v=mv(b[k],l[k],r[k]);if(v!==undefined)o[k]=v}return o}
+function mv(b,l,r){
+ if(eq(l,r))return l;if(eq(l,b))return r;if(eq(r,b))return l;
+ if(isA(l)&&isA(r))return mArr(isA(b)?b:[],l,r);
+ if(isO(l)&&isO(r))return mObj(isO(b)?b:{},l,r);
+ return l}
+const parse=s=>{try{return JSON.parse(s)}catch(e){return undefined}};
+function mergeStr(base,loc,rem){const l=parse(loc),r=parse(rem);if(l===undefined)return rem;if(r===undefined)return loc;
+ const m=mv(base?parse(base):undefined,l,r);return JSON.stringify(m)}
+const same=(a,b)=>{const x=parse(a),y=parse(b);return x!==undefined&&y!==undefined?eq(x,y):a===b};
+/* ---------- local bookkeeping ---------- */
+let dirty=new Set(parse(get('tt_dirty')||'[]')||[]);
+const saveDirty=()=>put('tt_dirty',JSON.stringify([...dirty])),
+ getBase=k=>get('tt_b:'+k),setBase=(k,v)=>put('tt_b:'+k,v),getVer=k=>get('tt_v:'+k),setVer=(k,v)=>put('tt_v:'+k,String(v)),
+ H=()=>{const h={apikey:cfg.key,'Content-Type':'application/json'};if(/^eyJ/.test(cfg.key))h.Authorization='Bearer '+cfg.key;return h};
+/* ---------- remote ---------- */
+async function rq(path,opt){opt=opt||{};const c=typeof AbortController!=='undefined'?new AbortController():null,t=c&&setTimeout(()=>c.abort(),9000);
+ try{return await F(BASE+path,Object.assign({},opt,{headers:Object.assign(H(),opt.headers||{}),signal:c?c.signal:undefined}))}finally{if(t)clearTimeout(t)}}
+async function rget(k){const r=await rq('?select=v,ver&k=eq.'+encodeURIComponent(k));if(!r.ok)throw new Error('get '+r.status);put('tt_synced','1');return (await r.json())[0]||null}
+async function rvers(keys){const r=await rq('?select=k,ver&k=in.('+keys.map(encodeURIComponent).join(',')+')');if(!r.ok)throw new Error('list '+r.status);put('tt_synced','1');return r.json()}
+/* ---------- push one key (merge, then compare-and-swap on ver) ---------- */
+async function push(k,changed){
+ for(let i=0;i<6;i++){
+  const rem=await rget(k),loc=get(k),remV=rem&&rem.v!==''?rem.v:null;
+  let merged=loc==null?'':(remV==null?loc:mergeStr(getBase(k),loc,remV));
+  if(remV!=null&&merged!==''&&same(merged,remV))merged=remV;          // nothing new to send: no write, no ping-pong
+  if(rem&&merged===rem.v){fin(k,loc,merged,rem.ver,changed);return}
+  let ok=false,ver=1;
+  if(rem){ver=rem.ver+1;const r=await rq('?k=eq.'+encodeURIComponent(k)+'&ver=eq.'+rem.ver,{method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify({v:merged,ver,updated_at:new Date().toISOString()})});
+   if(!r.ok)throw new Error('patch '+r.status);ok=(await r.json()).length===1}
+  else{const r=await rq('',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({k,v:merged,ver:1})});
+   if(r.status===409)ok=false;else if(!r.ok)throw new Error('post '+r.status);else ok=true}
+  if(ok){fin(k,loc,merged,ver,changed);return}
+ }
+ throw new Error('conflict '+k)}
+function fin(k,locAtStart,merged,ver,changed){
+ const now=get(k);setBase(k,merged);setVer(k,ver);
+ if(now===locAtStart||(now==null&&locAtStart==null)){            // untouched while we were talking to the server
+  dirty.delete(k);saveDirty();
+  if(merged===''){if(now!=null){del(k);changed&&changed.push(k)}}
+  else if(now!==merged){put(k,merged);changed&&changed.push(k)}}
+ /* else: edited again during the request -> stays dirty, merged on the next round */}
+/* ---------- pull ---------- */
+async function pull(keys,changed){
+ const rows=await rvers(keys);
+ for(const k of keys){
+  if(dirty.has(k)){await push(k,changed);continue}
+  const row=rows.find(x=>x.k===k),loc=get(k);
+  if(!row){if(loc!=null){dirty.add(k);saveDirty();await push(k,changed)}continue}      // first upload of existing data
+  if(String(row.ver)===getVer(k)&&getBase(k)!=null)continue;                          // already up to date
+  const rem=await rget(k);if(!rem||dirty.has(k))continue;
+  if(rem.v===''){if(loc!=null){del(k);changed.push(k)}setBase(k,'');setVer(k,rem.ver);continue}
+  if(loc!=null&&getBase(k)==null&&!same(loc,rem.v)){dirty.add(k);saveDirty();await push(k,changed);continue}   // old local data meets shared data: merge
+  if(loc==null||!same(loc,rem.v)){put(k,rem.v);changed.push(k)}
+  setBase(k,rem.v);setVer(k,rem.ver)}}
+/* ---------- cycle ---------- */
+let busy=null,timer=null,online=null;
+const watch=()=>{try{return(env.watch&&env.watch())||[]}catch(e){return[]}};
+function sync(extra){
+ if(!SB)return Promise.resolve(false);
+ if(busy)return busy.then(()=>sync(extra));
+ busy=(async()=>{const changed=[];let ok=false;
+  try{const keys=[...new Set(['tt_accounts',...watch(),...(extra||[])])];
+   for(const k of [...dirty])if(SYNCK(k))await push(k,changed);
+   await pull(keys,changed);ok=true}catch(e){ok=false}
+  if(online!==ok){online=ok;env.onStatus&&env.onStatus(ok)}
+  if(changed.length)try{env.onChange&&env.onChange(changed)}catch(e){}
+  return ok})().finally(()=>{busy=null;if(dirty.size&&env.auto!==false)schedule()});
+ return busy}
+function schedule(){if(!SB||timer)return;timer=setTimeout(()=>{timer=null;sync()},env.delay==null?700:env.delay)}
+/* ---------- hooks ---------- */
+if(SB){
+ proto.setItem=function(k,v){_s.call(this,k,v);if(this===ls&&SYNCK(k)){dirty.add(k);saveDirty();if(env.auto!==false)schedule()}};
+ proto.removeItem=function(k){_r.call(this,k);if(this===ls&&SYNCK(k)){dirty.add(k);saveDirty();if(env.auto!==false)schedule()}};
+ if(env.auto!==false){setInterval(()=>{if(!(typeof document!=='undefined'&&document.hidden))sync()},5000);
+  if(typeof window!=='undefined'){window.addEventListener('online',()=>sync());window.addEventListener('focus',()=>sync());
+   document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()})}}}
+return{on:SB,sync,synced:()=>get('tt_synced')==='1',_dirty:()=>[...dirty],_mergeStr:mergeStr}}
+
+let CSTAT=(window.TT_CONFIG&&TT_CONFIG.url)?'':'This device only (cloud not set up)';
+const SYNCAPI=TTSync({ls:localStorage,proto:Storage.prototype,fetch:(u,o)=>fetch(u,o),cfg:window.TT_CONFIG,
+ watch:()=>me&&me.role!=='guest'?['tindatala_'+me.username]:[],onStatus:cloudBadge,onChange:refreshUI});
+function cloudBadge(ok){CSTAT=ok?'\u2601 Online \u00b7 shared data':'\u26a0 No connection \u00b7 working offline';const e=document.getElementById('cs');if(e)e.textContent=CSTAT}
+function reloadD(){let t=null;try{t=localStorage.getItem('tindatala_'+me.username)}catch(e){}if(!t)return;try{const o=JSON.parse(t),d=Object.assign({products:[],sales:[],load:[],cash:[],utang:[],trash:[],zoom:1,profile:{}},o);d.profile=Object.assign({store:'',owner:'',photo:'',pw:''},o.profile);D=d}catch(e){}}
+/* when another phone changes the shared data, redraw (but never while someone is typing or a sheet is open) */
+function refreshUI(keys){if(!me||me.role=='guest')return;if($('#sheet').innerHTML)return;const a=document.activeElement;if(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))return;
+const sc=$('#app').scrollTop;loadA();const u=A.users.find(x=>x.username==me.username);if(u)me=u;
+if(me.role=='admin')drawAdmin();else{if(keys.includes('tindatala_'+me.username))reloadD();draw()}$('#app').scrollTop=sc}
 const P={kita:'<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',prod:'<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',load:'<rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2"/>',cash:'<path d="M7 7h13l-3-3"/><path d="M17 17H4l3 3"/>',debt:'<path d="M5 4h11a3 3 0 013 3v13H8a3 3 0 01-3-3V4z"/><path d="M9 9h6M9 13h6"/>',prof:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>',users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.5 3-5.5 6.5-5.5s6.5 2 6.5 5.5"/><path d="M16 4.6a3.5 3.5 0 010 6.8M18 14.8c2.2.7 3.5 2.4 3.5 5.2"/>',pays:'<rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 10h19M6 15h4"/>',alog:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',cal:'<rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M3 10h18M8 3v4M16 3v4"/>',pin:'<path d="M12 21s7-6.2 7-11.5A7 7 0 005 9.5C5 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',chat:'<path d="M4 6a3 3 0 013-3h10a3 3 0 013 3v7a3 3 0 01-3 3h-5.6l-3.9 3.7a.6.6 0 01-1-.44V16H7a3 3 0 01-3-3z"/><path d="M8.5 9.5h.01M12 9.5h.01M15.5 9.5h.01" stroke-width="2.6"/>',tel:'<path d="M5 4h4l2 5-2.5 1.5a11 11 0 005 5L15 13l5 2v4a2 2 0 01-2 2A16 16 0 013 6a2 2 0 012-2z"/>'};
 const ico=(k,z)=>`<svg width="${z||20}" height="${z||20}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px">${P[k]}</svg>`;
 const T=[['kita','kita','Earnings'],['prod','prod','Products'],['load','load','Load'],['cash','cash','Cash In/Out'],['debt','debt','Debts'],['prof','prof','Profile']];
@@ -193,7 +305,7 @@ if(np||cp){if(u.pw!==await H(cp))return tt('Wrong current password');if(np.lengt
 const old=u.username;if(un!==old){try{const k=localStorage.getItem('tindatala_'+old);if(k)localStorage.setItem('tindatala_'+un,k);localStorage.removeItem('tindatala_'+old);localStorage.setItem(SK,un);['tt_remember','tt_legacy'].forEach(x=>{if(localStorage.getItem(x)==old)localStorage.setItem(x,un)})}catch(e){}u.username=un}
 u.contact=ct;u.address=f('pad');saveA();me=u;save();draw();tt('Account saved')}
 function forgotTp(){if(me.role=='guest')return tt('Not available in guest view');loadA();const u=A.users.find(x=>x.username==me.username);u.tpReq=today();saveA();closeS();tt('Request sent. The admin will send you an SMS.')}
-function resetTp(un){const u=A.users.find(x=>x.username==un);try{const k='tindatala_'+un,o=JSON.parse(localStorage.getItem(k));if(o&&o.profile){o.profile.pw='';localStorage.setItem(k,JSON.stringify(o))}}catch(e){}delete u.tpReq;saveA();drawAdmin();tt('Trash password cleared. Tell the user by SMS.')}
+async function resetTp(un){await SYNCAPI.sync(['tindatala_'+un]);loadA();const u=A.users.find(x=>x.username==un);try{const k='tindatala_'+un,o=JSON.parse(localStorage.getItem(k));if(o&&o.profile){o.profile.pw='';localStorage.setItem(k,JSON.stringify(o))}}catch(e){}delete u.tpReq;saveA();drawAdmin();tt('Trash password cleared. Tell the user by SMS.')}
 function pset(k,v){D.profile[k]=v;save();head()}
 function pick(e){const fl=e.target.files[0];if(!fl)return;const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const c=document.createElement('canvas'),s=Math.min(1,220/Math.max(im.width,im.height));c.width=im.width*s;c.height=im.height*s;c.getContext('2d').drawImage(im,0,0,c.width,c.height);D.profile.photo=c.toDataURL('image/jpeg',.8);save();draw();toast('Photo attached')};im.src=r.result};r.readAsDataURL(fl)}
 function zoom(v){D.zoom=Math.min(1.3,Math.max(.9,Math.round(v*10)/10));document.documentElement.style.setProperty('--z',D.zoom);save();draw()}
@@ -304,8 +416,8 @@ function freeSlot(un){loadA();const x=A.users.find(a=>a.username==un);if(x){x.de
 const longDate=d=>{if(!d)return'';const[y,m,x]=d.split('-').map(Number);return MN[m-1]+' '+x+', '+y},ymL=k=>MN[+k.slice(5)-1]+' '+k.slice(0,4),raw=(e,h)=>_d.set.call(e,String(h).replace(/[\u0001\u0002]/g,'')),tt=m=>toast(S(m));
 const IC=d=>`<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`,EYE=IC('<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),EYE0=IC('<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M4 4l16 16"/>');
 let lid=0;
-function logo(z){const i='lg'+(lid++);return`<svg xmlns="http://www.w3.org/2000/svg" width="${z}" height="${z}" viewBox="0 0 96 96"><defs><linearGradient id="${i}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9ccb7f"/><stop offset="1" stop-color="#1b3d0d"/></linearGradient><clipPath id="${i}c"><path d="M26 22H70L80 42H16Z"/><circle cx="24" cy="42" r="8"/><circle cx="40" cy="42" r="8"/><circle cx="56" cy="42" r="8"/><circle cx="72" cy="42" r="8"/></clipPath></defs><rect x="3" y="3" width="90" height="90" rx="26" fill="url(#${i})"/><ellipse cx="36" cy="18" rx="30" ry="11" fill="#fff" opacity=".13"/><rect x="22" y="42" width="52" height="34" rx="3" fill="#eaf3e1"/><rect x="40" y="56" width="16" height="20" rx="3" fill="#1b3d0d"/><rect x="26" y="56" width="10" height="10" rx="2" fill="#9ccb7f"/><rect x="60" y="56" width="10" height="10" rx="2" fill="#9ccb7f"/><g clip-path="url(#${i}c)"><rect x="16" y="22" width="16" height="30" fill="#fff"/><rect x="32" y="22" width="16" height="30" fill="#f5b83d"/><rect x="48" y="22" width="16" height="30" fill="#fff"/><rect x="64" y="22" width="16" height="30" fill="#f5b83d"/></g><rect x="13" y="76" width="70" height="5" rx="2.5" fill="#f5b83d"/><circle cx="76" cy="20" r="11" fill="#f5b83d" stroke="#fff" stroke-width="3"/><path d="M70 24L74 19L77 22L82 15" fill="none" stroke="#1b3d0d" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
-$('#fav').href='data:image/svg+xml,'+encodeURIComponent(logo(64));
+function logo(z){return`<img src="icon-192.png" width="${z}" height="${z}" alt="TindaTala" style="display:block;margin:0 auto;border-radius:22%;object-fit:cover">`}
+$('#fav').href='icon-192.png';
 function loadA(){try{A=JSON.parse(localStorage.getItem(AK))}catch(e){}if(!A||!A.users)A={fee:100,users:[]}}
 function saveA(){try{localStorage.setItem(AK,JSON.stringify(A))}catch(e){}}
 function loadUser(u){let s=null;try{s=localStorage.getItem('tindatala_'+u.username);if(!s&&!localStorage.getItem('tt_legacy')&&(s=localStorage.getItem('tindatala')))localStorage.setItem('tt_legacy',u.username)}catch(e){}
@@ -319,28 +431,28 @@ document.documentElement.style.setProperty('--z',1);PH.classList.remove('auth');
 function logout(){PH.classList.remove('guest');if(me&&me.role!='guest')freeSlot(me.username);try{localStorage.removeItem(SK)}catch(e){}me=null;closeS();$('#fab').innerHTML='';authView('in')}
 function msg(t,ok){const e=$('#am');e.className='am'+(ok?' ok':'');e.textContent=t}
 function authView(m,note){PH.classList.add('auth');const up=m=='up',I=(i,l,t,w)=>`<div${w?' class="w"':''}><label>${l}</label>${t=='password'?`<div class="pw"><input id="${i}" type="password" autocomplete="off"><button type="button" onclick="tp('${i}',this)" aria-label="Show or hide password">${EYE}</button></div>`:`<input id="${i}" type="text" autocomplete="off">`}</div>`;
-raw($('#app'),`<div class="au">${logo(64)}<h1>Tinda<span>Tala</span></h1><small>Tindahan Management System</small>
+raw($('#app'),`<div class="au">${logo(96)}<h1>Tinda<span>Tala</span></h1><small>Tindahan Management System</small><div class="m" id="cs" style="margin-top:2px">${CSTAT}</div>
 
 <div class="card"><div class="g">${up?I('rn','Full name')+I('rs','Store name')+I('ru','Username')+I('rc','Contact number','tel')+I('ra','Address','text',1)+I('rp','Password','password')+I('rp2','Confirm password','password'):I('lu','Username','text',1)+I('lp','Password','password',1)}</div>${up?'':'<label class="rm"><input type="checkbox" id="lr" checked> Remember me</label>'}<div class="am${note?' ok':''}" id="am">${note||''}</div><button class="btn" style="margin-top:2px" onclick="${up?'doReg()':'doLogin()'}">${up?'Send for approval':'Log in'}</button></div>
 ${up?`<div class="m" style="padding:0 6px;line-height:1.5">The admin will send the requirements and approval to open your account through your contact number.</div><button class="lk" style="font-size:12.5px;margin-top:4px" onclick="authView('in')">‹ Back</button>`:`<div style="margin-top:2px"><div class="m" style="margin-bottom:6px">New here? Accounts need admin approval.</div><button class="btn" style="margin:0;padding:9px;font-size:13px;background:var(--st);color:var(--tx);border:1px solid var(--bd)" onclick="authView('up')">Create account</button><button class="lk" style="font-size:13px;margin-top:8px" onclick="enterGuest()">Guest View</button></div>`}`);
 if(!up){try{const sv=JSON.parse(localStorage.getItem('tt_saved')||'[]').filter(x=>/^[a-z0-9_]+$/.test(x));if(sv.length)$('.au .card').insertAdjacentHTML('afterend','<div class="m" style="margin-top:8px">Saved accounts</div><div class="ch" style="justify-content:center">'+sv.map(x=>'<button onclick="$(\'#lu\').value=\''+x+'\';$(\'#lp\').focus()">'+x+'</button>').join('')+'</div>')}catch(e){}let r='';try{r=localStorage.getItem('tt_remember')||''}catch(e){}if(r){$('#lu').value=r;$('#lr').checked=true}}
 document.querySelectorAll('.au input').forEach(e=>e.onkeydown=k=>{if(k.key=='Enter')(up?doReg:doLogin)()})}
-async function doLogin(){loadA();const un=$('#lu').value.trim().toLowerCase(),u=A.users.find(x=>x.username==un);
+async function doLogin(){if(SYNCAPI.on)msg('Checking…',1);const on=await SYNCAPI.sync();await ensureAdmin();loadA();if(SYNCAPI.on&&!on&&!A.users.length)return msg('No internet connection. Please try again.');const un=$('#lu').value.trim().toLowerCase(),u=A.users.find(x=>x.username==un);
 if(!u||u.pw!==await H($('#lp').value))return msg('Wrong username or password.');
 if(u.status=='pending')return msg('Your account is waiting for admin approval.');
 if(u.status=='rejected')return msg('The admin declined this account request.');
 if(u.status=='suspended')return msg('This account is suspended. Contact the admin.');
 if(!claimSlot(u))return msg('This account is already logged in on '+MAXDEV+' phones. Log out on one first.');
-try{localStorage.setItem(SK,u.username);if($('#lr').checked)localStorage.setItem('tt_remember',u.username);else localStorage.removeItem('tt_remember')}catch(e){}try{let sv=JSON.parse(localStorage.getItem('tt_saved')||'[]');localStorage.setItem('tt_saved',JSON.stringify([u.username,...sv.filter(x=>x!=u.username)].slice(0,5)))}catch(e){}logAct(u);enter(u)}
+try{localStorage.setItem(SK,u.username);if($('#lr').checked)localStorage.setItem('tt_remember',u.username);else localStorage.removeItem('tt_remember')}catch(e){}try{let sv=JSON.parse(localStorage.getItem('tt_saved')||'[]');localStorage.setItem('tt_saved',JSON.stringify([u.username,...sv.filter(x=>x!=u.username)].slice(0,5)))}catch(e){}logAct(u);await SYNCAPI.sync(['tindatala_'+u.username]);enter(u)}
 function tp(i,b){const e=$('#'+i),h=e.type=='password';e.type=h?'text':'password';b.innerHTML=h?EYE0:EYE}
-async function doReg(){loadA();const g=k=>$('#'+k).value,nm=f('rn'),un=f('ru').toLowerCase();
+async function doReg(){await SYNCAPI.sync();loadA();const g=k=>$('#'+k).value,nm=f('rn'),un=f('ru').toLowerCase();
 if(!nm||!un||!f('rc')||!f('ra')||!g('rp'))return msg('Fill in your name, username, contact, address and password.');
 if(!/^[a-z0-9_]{3,20}$/.test(un))return msg('Username: 3–20 letters, numbers or _ only.');
 if(!/^[0-9+\s-]{7,15}$/.test(f('rc')))return msg('Enter a valid contact number.');
 if(g('rp').length<4)return msg('Use at least 4 characters for the password.');
 if(g('rp')!==g('rp2'))return msg('Passwords do not match.');
 if(A.users.some(x=>x.username==un))return msg('That username is taken. Try another.');
-A.users.push({username:un,name:nm,store:f('rs'),contact:f('rc'),address:f('ra'),pw:await H(g('rp')),role:'user',status:'pending',created:today(),pays:{}});saveA();authView('in','Account sent! The admin will contact you with the requirements and approval.')}
+A.users.push({username:un,name:nm,store:f('rs'),contact:f('rc'),address:f('ra'),pw:await H(g('rp')),role:'user',status:'pending',created:today(),pays:{}});saveA();const sent=await SYNCAPI.sync();authView('in',SYNCAPI.on&&!sent?'Saved on this phone, but there is no internet. Open the app again when online so it can be sent to the admin.':'Account sent! The admin will contact you with the requirements and approval.')}
 function PM(){const m=A.pay||{};return m.number||m.name?`<div class="m" style="margin:6px 0">${S('Pay to: '+[m.wallet||'GCash',m.name,m.number].filter(Boolean).join(' · '))}</div>${m.note?`<div class="m">${S(m.note)}</div>`:''}`:`<div class="m" style="margin:6px 0">${S('The admin has not set a payment method yet.')}</div>`}
 function payCard(){const k=today().slice(0,7),P=me.pays||{},p=P[k],st=p?p.status:'none',L={none:'Unpaid',pending:'Waiting for admin',verified:'Verified',rejected:'Rejected'},C={none:'#888',pending:'#d9951a',verified:'#2f7d32',rejected:'#b3382c'};
 return`<div><div class="row"><span><b>${S(ymL(k))}</b> · ${S(pf(A.fee))}</span><span class="tag" style="--cc:${C[st]}">${S(L[st])}</span></div><div class="m">${S('Due '+longDate(dueOf(k,me))+' · '+dueTxt(dueOf(k,me)))}</div>${PM()}
@@ -442,8 +554,22 @@ return`<div class="tg"><div class="tgh"><button class="tgb" onclick="closeS()">�
 const p=ad?cw:admU(),u=A.users.find(x=>x.username==p)||{},m=cmsg(my,p),nm=ad?(u.name||p):'Admin';let ch=0,last='';m.forEach(x=>{if(x.t==my&&!x.r){x.r=1;ch=1}});if(ch)saveA();
 return`<div class="tg"><div class="tgh"><button class="tgb" onclick="${ad?'chatOpen()':'closeS()'}">‹</button>${ava(nm,36,ad?p:'')}<div><b>${esc(nm)}</b><div class="m" style="margin:0">${ad?'@'+esc(p):'Store admin'}</div></div></div><div id="cmsgs" data-n="${m.length}" class="tgc">${m.length?m.map(x=>{const mine=x.f==my,d=x.a.slice(0,10),h=d!=last?`<div class="tgd"><span>${d==today()?'Today':d}</span></div>`:'';last=d;return h+`<div class="tgw ${mine?'o':''}"><div class="tgbub ${mine?'o':''}">${esc(x.x)}<span class="tgtm">${tm(x)}${mine?(x.r?' ✓✓':' ✓'):''}</span></div></div>`}).join(''):'<div class="em" style="text-align:center">No messages yet. Say hi!</div>'}</div><div class="tgi"><input id="cin" placeholder="Message" autocomplete="off" onkeydown="if(event.key==='Enter')chatSend()"><button onclick="chatSend()">➤</button></div></div>`}
 /* ===== END PATCH ===== */
-async function boot(){loadA();for(const u of A.users)if(u.role=='admin'&&String(u.pw).startsWith('x')){u.pw=await H('admin123');saveA()}if(!A.users.some(u=>u.role=='admin')){A.users.unshift({username:'admin',name:'Administrator',store:'',pw:await H('admin123'),role:'admin',status:'approved',created:today(),pays:{}});saveA()}
+async function ensureAdmin(){loadA();for(const u of A.users)if(u.role=='admin'&&String(u.pw).startsWith('x')){u.pw=await H('admin123');saveA()}if(!A.users.some(u=>u.role=='admin')&&(!SYNCAPI.on||SYNCAPI.synced())){A.users.unshift({username:'admin',name:'Administrator',store:'',pw:await H('admin123'),role:'admin',status:'approved',created:today(),pays:{}});saveA()}}
+async function boot(){await SYNCAPI.sync();await ensureAdmin();loadA();
 let k='';try{k=localStorage.getItem(SK)}catch(e){}const u=A.users.find(x=>x.username==k&&x.status=='approved');u&&claimSlot(u)?enter(u):authView('in')}
-hydrate().then(boot);
+boot();
+(()=>{if(matchMedia('(display-mode: standalone)').matches||navigator.standalone)return;
+try{if(localStorage.getItem('tt_nobanner'))return}catch(e){}
+const ios=/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+let ev=null,b=document.createElement('div');
+b.style.cssText='position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:99;background:#1b2a16;color:#fff;border-radius:14px;padding:12px 14px;font:13px/1.35 system-ui,-apple-system,sans-serif;display:flex;align-items:center;gap:10px;box-shadow:0 6px 20px #0006';
+const bs='border:0;border-radius:10px;padding:8px 12px;font:inherit;font-weight:700;cursor:pointer;';
+function show(h,inst){b.innerHTML='<div style="flex:1">'+h+'</div>'+(inst?'<button id="ttI" style="'+bs+'background:#8cb873;color:#1b2a16">Install</button>':'')+'<button id="ttX" aria-label="Close" style="'+bs+'background:none;color:#fff;font-size:16px;padding:4px 8px">\u2715</button>';
+document.body.appendChild(b);
+b.querySelector('#ttX').onclick=()=>{b.remove();try{localStorage.setItem('tt_nobanner','1')}catch(e){}};
+const i=b.querySelector('#ttI');if(i)i.onclick=()=>{b.remove();ev&&ev.prompt()}}
+if(ios)setTimeout(()=>show('Install TindaTala: tap <b>Share</b> (the square with an arrow) then <b>Add to Home Screen</b>.'),1500);
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();ev=e;show('Install TindaTala on your phone.',1)});
+})();
 if('serviceWorker' in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('sw.js').catch(()=>{});
 </script></body></html>
